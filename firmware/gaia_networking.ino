@@ -1,7 +1,7 @@
-/* Pruebas de conectividad WiFi para Gaia V0.0.1
-  - V0.0.1: Setup WiFi inicial con red WiFi generada en modo AP, DNS en modo STA.
+/* Pruebas de conectividad WiFi para Gaia V0.0.2
+  - V0.0.2: Reorganización de sección de configuración y preparación para actualizaciones OTA.
 */
-#define FIRMWARE_VERSION "0.0.1"
+#define FIRMWARE_VERSION "0.0.2"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <AsyncTCP.h>
@@ -100,11 +100,46 @@ String mainPageHTML() {
   }
   .content.active { display: block; }
   h2 { color: #4CAF50; }
-  form {
+  
+  /* Firmware section styling */
+  .firmware-section {
     background: white;
     padding: 15px;
     border-radius: 8px;
     box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    margin-bottom: 15px;
+  }
+  .firmware-section button {
+    background: #4CAF50;
+    color: white;
+    border: none;
+    padding: 8px 12px;
+    margin-top: 10px;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .firmware-section button:hover {
+    background: #45a049;
+  }
+
+  /* WiFi dropdown styling */
+  .dropdown {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    overflow: hidden;
+  }
+  .dropdown-header {
+    background: #eee;
+    padding: 10px;
+    cursor: pointer;
+    font-weight: bold;
+  }
+  .dropdown-content {
+    display: none;
+    padding: 15px;
+  }
+  form {
     max-width: 300px;
   }
   input[type=text], input[type=password] {
@@ -144,6 +179,10 @@ function updateClock(){
     document.getElementById('clock').innerText = t;
   });
 }
+function toggleDropdown(id) {
+  var content = document.getElementById(id);
+  content.style.display = (content.style.display === "block") ? "none" : "block";
+}
 setInterval(updateClock, 1000);
 window.onload = function() { updateClock(); showTab('hora'); }
 </script>
@@ -157,7 +196,7 @@ window.onload = function() { updateClock(); showTab('hora'); }
 
 <nav>
   <div id="tab-hora" class="tab" onclick="showTab('hora')">Hora actual</div>
-  <div id="tab-config" class="tab" onclick="showTab('config')">Configuración WiFi</div>
+  <div id="tab-config" class="tab" onclick="showTab('config')">Configuración</div>
 </nav>
 
 <div id="content-hora" class="content">
@@ -166,14 +205,27 @@ window.onload = function() { updateClock(); showTab('hora'); }
 </div>
 
 <div id="content-config" class="content">
-  <h2>Configurar WiFi</h2>
-  <form action='/save' method='POST'>
-    <label>SSID:</label>
-    <input type='text' name='ssid' placeholder='Nombre de la red'>
-    <label>Password:</label>
-    <input type='password' name='pass' placeholder='Contraseña'>
-    <input type='submit' value='Aplicar'>
-  </form>
+  <!-- Firmware Section -->
+  <div class="firmware-section">
+    <h2>Firmware</h2>
+    <p>Versión actual: <strong>v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</strong></p>
+    <button onclick="alert('Función de búsqueda de actualizaciones próximamente')">Buscar actualizaciones</button>
+    <button onclick="alert('Función de actualización próximamente')">Actualizar firmware</button>
+  </div>
+
+  <!-- WiFi Dropdown Section -->
+  <div class="dropdown">
+    <div class="dropdown-header" onclick="toggleDropdown('wifi-settings')">Configuración WiFi ▼</div>
+    <div id="wifi-settings" class="dropdown-content">
+      <form action='/save' method='POST'>
+        <label>SSID:</label>
+        <input type='text' name='ssid' placeholder='Nombre de la red'>
+        <label>Password:</label>
+        <input type='password' name='pass' placeholder='Contraseña'>
+        <input type='submit' value='Aplicar'>
+      </form>
+    </div>
+  </div>
 </div>
 
 </body>
