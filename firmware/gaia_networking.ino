@@ -1,9 +1,11 @@
-#define FIRMWARE_VERSION "0.0.7"
+#define FIRMWARE_VERSION "0.0.8"
 
-/* Gaia OTA desde GitHub - Versión Optimizada
-   - Usa chunks pequeños con gestión inteligente del watchdog
-   - Detiene AsyncTCP durante escritura crítica
-   - Manejo robusto de memoria y errores
+/* Gaia Estación Meteorológica - Versión con Configuración WiFi
+   - Sistema de configuración WiFi inicial con modo AP
+   - OTA desde GitHub con chunks optimizados
+   - Interfaz web responsiva y funcional
+   - Gestión automática de conexiones WiFi
+   - Almacenamiento de credenciales en EEPROM
 */
 
 #include <WiFi.h>
@@ -15,11 +17,18 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
+#include <EEPROM.h>
 
-// ---------------- Credenciales ----------------
-const char* ssid = "INFINITUMCDB2";
-const char* password = "UC4Zn9xZue";
+// ---------------- Configuración de memoria ----------------
+#define EEPROM_SIZE 512
+#define WIFI_SSID_ADDR 0
+#define WIFI_PASS_ADDR 100
+#define WIFI_CONFIGURED_ADDR 200
+
+// ---------------- Configuración del dispositivo ----------------
+const char* ap_ssid = "Gaia Setup";
 const char* hostname = "gaia";
+const int setup_timeout = 30000; // 30 segundos para intentar conexión
 
 AsyncWebServer server(80);
 
@@ -27,8 +36,146 @@ AsyncWebServer server(80);
 String latestVersion = "";
 String latestBinUrl = "";
 bool otaInProgress = false;
+bool isAPMode = false;
+String currentSSID = "";
+String currentPassword = "";
 
-// ---------------- OTA helpers ----------------
+// ---------------- Gestión de credenciales WiFi ----------------
+
+/**
+ * Guarda las credenciales WiFi en la EEPROM
+ * @param ssid SSID de la red WiFi
+ * @param password Contraseña de la red WiFi
+ */
+void saveWiFiCredentials(String ssid, String password) {
+  Serial.println("[WiFi] Guardando credenciales en EEPROM...");
+  
+  // Limpiar las direcciones de memoria
+  for (int i = 0; i < 100; i++) {
+    EEPROM.write(WIFI_SSID_ADDR + i, 0);
+    EEPROM.write(WIFI_PASS_ADDR + i, 0);
+  }
+  
+  // Escribir SSID
+  for (int i = 0; i < ssid.length() && i < 99; i++) {
+    EEPROM.write(WIFI_SSID_ADDR + i, ssid[i]);
+  }
+  
+  // Escribir contraseña
+  for (int i = 0; i < password.length() && i < 99; i++) {
+    EEPROM.write(WIFI_PASS_ADDR + i, password[i]);
+  }
+  
+  // Marcar como configurado
+  EEPROM.write(WIFI_CONFIGURED_ADDR, 1);
+  EEPROM.commit();
+  
+  Serial.println("[WiFi] Credenciales guardadas exitosamente");
+}
+
+/**
+ * Carga las credenciales WiFi desde la EEPROM
+ * @return true si hay credenciales válidas guardadas
+ */
+bool loadWiFiCredentials() {
+  Serial.println("[WiFi] Cargando credenciales desde EEPROM...");
+  
+  if (EEPROM.read(WIFI_CONFIGURED_ADDR) != 1) {
+    Serial.println("[WiFi] No hay credenciales guardadas");
+    return false;
+  }
+  
+  currentSSID = "";
+  currentPassword = "";
+  
+  // Leer SSID
+  for (int i = 0; i < 99; i++) {
+    char c = EEPROM.read(WIFI_SSID_ADDR + i);
+    if (c == 0) break;
+    currentSSID += c;
+  }
+  
+  // Leer contraseña
+  for (int i = 0; i < 99; i++) {
+    char c = EEPROM.read(WIFI_PASS_ADDR + i);
+    if (c == 0) break;
+    currentPassword += c;
+  }
+  
+  if (currentSSID.length() > 0) {
+    Serial.println("[WiFi] Credenciales cargadas: " + currentSSID);
+    return true;
+  }
+  
+  Serial.println("[WiFi] Credenciales inválidas en EEPROM");
+  return false;
+}
+
+/**
+ * Borra las credenciales WiFi de la EEPROM
+ */
+void clearWiFiCredentials() {
+  Serial.println("[WiFi] Borrando credenciales...");
+  EEPROM.write(WIFI_CONFIGURED_ADDR, 0);
+  EEPROM.commit();
+}
+
+// ---------------- Gestión de conexiones WiFi ----------------
+
+/**
+ * Intenta conectarse a una red WiFi específica
+ * @param ssid SSID de la red
+ * @param password Contraseña de la red
+ * @return true si la conexión fue exitosa
+ */
+bool connectToWiFi(String ssid, String password) {
+  Serial.println("[WiFi] Intentando conectar a: " + ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < setup_timeout) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Conectado exitosamente");
+    Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
+    Serial.println("[WiFi] RSSI: " + String(WiFi.RSSI()) + " dBm");
+    return true;
+  } else {
+    Serial.println("\n[WiFi] Error: No se pudo conectar");
+    return false;
+  }
+}
+
+/**
+ * Inicia el modo Access Point para configuración inicial
+ */
+void startAccessPoint() {
+  Serial.println("[AP] Iniciando modo Access Point...");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid);
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.println("[AP] Red: " + String(ap_ssid));
+  Serial.println("[AP] IP: " + IP.toString());
+  Serial.println("[AP] Accede a: http://gaia.local o http://" + IP.toString());
+  
+  isAPMode = true;
+}
+
+// ---------------- Funciones OTA (mantenidas intactas) ----------------
+
+/**
+ * Inicia la actualización OTA del firmware
+ * @param client Cliente WiFi para la descarga
+ * @param contentLength Tamaño del archivo de firmware
+ * @return true si la actualización fue exitosa
+ */
 bool startOTAUpdate(WiFiClient* client, int contentLength) {
   Serial.println("[OTA] Iniciando escritura al flash...");
 
@@ -97,6 +244,10 @@ bool startOTAUpdate(WiFiClient* client, int contentLength) {
   return true;
 }
 
+/**
+ * Ejecuta la actualización completa del firmware
+ * @param url URL del archivo de firmware
+ */
 void performFirmwareUpdate(String url) {
   Serial.println("[OTA] ===========================================");
   Serial.println("[OTA] Iniciando proceso de actualización OTA");
@@ -176,9 +327,17 @@ void performFirmwareUpdate(String url) {
   }
 }
 
-// ---------------- Version check ----------------
+/**
+ * Verifica la última versión disponible en GitHub
+ */
 void checkLatestRelease() {
   if (otaInProgress) return;
+  
+  // Solo verificar si estamos conectados a WiFi (no en modo AP)
+  if (isAPMode || WiFi.status() != WL_CONNECTED) {
+    Serial.println("[GitHub] No hay conexión a internet para verificar actualizaciones");
+    return;
+  }
   
   HTTPClient http;
   WiFiClientSecure client;
@@ -213,14 +372,23 @@ void checkLatestRelease() {
   http.end();
 }
 
-// ---------------- HTML UI ----------------
+// ---------------- Interfaz HTML ----------------
+
+/**
+ * Genera el HTML de la página principal con todas las funcionalidades
+ * @return String con el código HTML completo
+ */
 String mainPageHTML() {
+  String wifiStatus = isAPMode ? "Modo configuración (AP)" : ("Conectado a: " + currentSSID);
+  String wifiStatusClass = isAPMode ? "status-warning" : "status-ok";
+  String deviceIP = isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gaia</title>
+  <title>Gaia - Estación Meteorológica</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { 
@@ -228,7 +396,7 @@ String mainPageHTML() {
       background: linear-gradient(135deg, #1e5772 0%, #2a7d98 100%);
       min-height: 100vh; padding: 20px;
     }
-    .container { max-width: 500px; margin: 0 auto; }
+    .container { max-width: 600px; margin: 0 auto; }
     .card { 
       background: rgba(255,255,255,0.95); 
       border-radius: 20px; padding: 25px; margin-bottom: 20px; 
@@ -257,6 +425,48 @@ String mainPageHTML() {
     .info-label { color: #666; font-size: 0.9em; }
     .info-value { font-weight: 600; color: #333; }
     
+    .tabs {
+      display: flex; border-bottom: 2px solid #eee; margin-bottom: 20px;
+    }
+    .tab {
+      flex: 1; padding: 15px; text-align: center; cursor: pointer;
+      background: none; border: none; font-size: 1em; font-weight: 600;
+      color: #666; transition: all 0.3s ease;
+    }
+    .tab.active {
+      color: #4b68a3; border-bottom: 3px solid #4b68a3;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    
+    .collapsible {
+      background: #f8f9fa; border: none; padding: 15px; width: 100%;
+      text-align: left; font-size: 1em; font-weight: 600;
+      cursor: pointer; border-radius: 10px; margin-bottom: 10px;
+      transition: all 0.3s ease;
+    }
+    .collapsible:hover { background: #e9ecef; }
+    .collapsible.active { background: #dee2e6; }
+    .collapsible-content {
+      display: none; padding: 15px; background: white;
+      border-radius: 10px; margin-bottom: 15px;
+    }
+    .collapsible-content.active { display: block; }
+    
+    .form-group {
+      margin-bottom: 15px;
+    }
+    .form-label {
+      display: block; margin-bottom: 5px; font-weight: 600; color: #333;
+    }
+    .form-input {
+      width: 100%; padding: 12px; border: 2px solid #e9ecef;
+      border-radius: 8px; font-size: 1em; transition: border-color 0.3s ease;
+    }
+    .form-input:focus {
+      outline: none; border-color: #4b68a3;
+    }
+    
     .btn {
       width: 100%; padding: 15px; margin: 8px 0;
       border: none; border-radius: 12px; font-size: 1em; font-weight: 600;
@@ -272,6 +482,7 @@ String mainPageHTML() {
       background: #ccc; cursor: not-allowed; transform: none; box-shadow: none;
     }
     .btn-update { background: linear-gradient(45deg, #ff6b35, #f7931e); }
+    .btn-wifi { background: linear-gradient(45deg, #00b894, #00cec9); }
     
     .progress-container {
       margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 12px;
@@ -293,6 +504,12 @@ String mainPageHTML() {
       border-left: 4px solid #e17055;
     }
     
+    .success-box {
+      background: linear-gradient(45deg, #a7ffeb, #64ffda); 
+      padding: 15px; border-radius: 10px; margin: 15px 0;
+      border-left: 4px solid #26a69a;
+    }
+    
     .spinner {
       width: 20px; height: 20px; margin-right: 10px;
       border: 2px solid transparent; border-top: 2px solid currentColor;
@@ -300,64 +517,255 @@ String mainPageHTML() {
       display: inline-block;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    .section-title {
+      font-size: 1.2em; font-weight: 700; color: #333;
+      margin-bottom: 15px; padding-bottom: 8px;
+      border-bottom: 2px solid #4b68a3;
+    }
   </style>
 </head>
 <body>
   <div class="container">
+    <!-- Información del dispositivo -->
     <div class="card">
       <div class="header">
         <h1>Gaia</h1>
-        <p style="margin-top: 5px; font-size: 0.9em; opacity: 0.8;">ESP32-S3 Firmware Update System</p>
-      </div>
-      
-      <div class="info-row">
-        <span class="info-label">Firmware Actual</span>
-        <span class="info-value">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Dispositivo</span>
-        <span class="info-value">ESP32-S3</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Estado</span>
-        <span class="info-value" id="status">
-          <span class="status-indicator status-ok"></span>Sistema Listo
-        </span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">IP Address</span>
-        <span class="info-value" id="deviceIP">Cargando...</span>
+        <p style="margin-top: 5px; font-size: 0.9em; opacity: 0.8;">Estacion Meteorologica ESP32-S3</p>
       </div>
     </div>
     
+    <!-- Pestañas -->
     <div class="card">
-      <button id="checkBtn" class="btn" onclick="checkUpdate()">
-        <span id="checkIcon"></span> Verificar Actualizaciones
-      </button>
-      
-      <button id="updateBtn" class="btn btn-update" onclick="doUpdate()" disabled>
-        <span id="updateIcon"></span> Actualizar Firmware
-      </button>
-      
-      <div id="progressContainer" class="progress-container" style="display:none;">
-        <div class="progress-bar">
-          <div id="progressFill" class="progress-fill"></div>
-        </div>
-        <div id="progressText" class="progress-text">Preparando...</div>
+      <div class="tabs">
+        <button class="tab active" onclick="showTab('panel')">Panel</button>
+        <button class="tab" onclick="showTab('config')">Configuracion</button>
       </div>
       
-      <div id="warningBox" class="warning-box" style="display:none;">
-        <strong>⚠️ Actualización en Proceso</strong><br>
-        No desconectes el dispositivo. El proceso puede tardar hasta 5 minutos.
+      <!-- Contenido pestaña Panel -->
+      <div id="panel" class="tab-content active">
+        <div class="section-title">Panel Principal</div>
+        <p>Bienvenido al panel de control de Gaia. Desde aqui puedes acceder a todas las funciones de configuracion y monitoreo del sistema.</p>
+      </div>
+      
+      <!-- Contenido pestaña Configuración -->
+      <div id="config" class="tab-content">
+        <!-- Estado del Sistema -->
+        <div class="section-title">Estado del Sistema</div>
+        <button class="collapsible" id="systemCollapsible">Informacion del Dispositivo</button>
+        <div class="collapsible-content" id="systemContent">
+          <div class="info-row">
+            <span class="info-label">Firmware</span>
+            <span class="info-value">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Dispositivo</span>
+            <span class="info-value">ESP32-S3</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Estado WiFi</span>
+            <span class="info-value" id="wifiStatus">
+              <span class="status-indicator )rawliteral" + wifiStatusClass + R"rawliteral("></span>)rawliteral" + wifiStatus + R"rawliteral(
+            </span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Direccion IP</span>
+            <span class="info-value" id="deviceIP">)rawliteral" + deviceIP + R"rawliteral(</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">RAM Libre</span>
+            <span class="info-value" id="freeHeap">Cargando...</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Flash Libre</span>
+            <span class="info-value" id="freeSketch">Cargando...</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Tiempo Activo</span>
+            <span class="info-value" id="uptime">Cargando...</span>
+          </div>
+        </div>
+        
+        <!-- Configuración WiFi -->
+        <div class="section-title">Configuracion WiFi</div>
+        <button class="collapsible" id="wifiCollapsible">Configuracion de Red WiFi</button>
+        <div class="collapsible-content" id="wifiContent">
+          <div class="info-row">
+            <span class="info-label">Red Actual</span>
+            <span class="info-value" id="currentNetwork">)rawliteral" + (isAPMode ? "Ninguna (Modo AP)" : currentSSID) + R"rawliteral(</span>
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">Nuevo SSID</label>
+            <input type="text" class="form-input" id="newSSID" placeholder="Nombre de la red WiFi">
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">Nueva Contraseña</label>
+            <input type="password" class="form-input" id="newPassword" placeholder="Contraseña de la red WiFi">
+          </div>
+          
+          <button class="btn btn-wifi" onclick="updateWiFi()" id="wifiUpdateBtn">
+            <span id="wifiUpdateIcon">Conectar a Nueva Red</span>
+          </button>
+          
+          <div id="wifiMessage" style="display:none; margin-top: 15px;"></div>
+        </div>
+        
+        <!-- Configuración de versión -->
+        <div class="section-title" style="margin-top: 30px;">Actualizacion de Firmware</div>
+        <button class="collapsible" id="versionCollapsible">Gestion de Versiones</button>
+        <div class="collapsible-content" id="versionContent">
+          <div class="info-row">
+            <span class="info-label">Version Actual</span>
+            <span class="info-value">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Ultima Version</span>
+            <span class="info-value" id="latestVersion">Verificar actualizaciones</span>
+          </div>
+          
+          <button id="checkBtn" class="btn" onclick="checkUpdate()">
+            <span id="checkIcon">Buscar Actualizaciones</span>
+          </button>
+          
+          <button id="updateBtn" class="btn btn-update" onclick="doUpdate()" disabled>
+            <span id="updateIcon">Actualizar Firmware</span>
+          </button>
+          
+          <div id="progressContainer" class="progress-container" style="display:none;">
+            <div class="progress-bar">
+              <div id="progressFill" class="progress-fill"></div>
+            </div>
+            <div id="progressText" class="progress-text">Preparando...</div>
+          </div>
+          
+          <div id="warningBox" class="warning-box" style="display:none;">
+            <strong>Actualizacion en Proceso</strong><br>
+            No desconectes el dispositivo. El proceso puede tardar hasta 5 minutos.
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
 <script>
 let updateInProgress = false;
+let wifiUpdateInProgress = false;
 
+// Gestión de pestañas
+function showTab(tabName) {
+  // Ocultar todos los contenidos
+  const contents = document.querySelectorAll('.tab-content');
+  contents.forEach(content => content.classList.remove('active'));
+  
+  // Desactivar todas las pestañas
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach(tab => tab.classList.remove('active'));
+  
+  // Mostrar contenido seleccionado
+  document.getElementById(tabName).classList.add('active');
+  
+  // Activar pestaña seleccionada
+  event.target.classList.add('active');
+}
+
+// Gestión de contenido colapsable
+document.addEventListener('DOMContentLoaded', function() {
+  const collapsibles = document.querySelectorAll('.collapsible');
+  collapsibles.forEach(function(collapsible) {
+    collapsible.addEventListener('click', function() {
+      this.classList.toggle('active');
+      const content = this.nextElementSibling;
+      content.classList.toggle('active');
+    });
+  });
+  
+  // Actualizar información del sistema
+  updateSystemInfo();
+});
+
+function updateSystemInfo() {
+  fetch('/system-info')
+  .then(r => r.json())
+  .then(data => {
+    document.getElementById('freeHeap').textContent = data.freeHeap;
+    document.getElementById('freeSketch').textContent = data.freeSketch;
+    document.getElementById('uptime').textContent = data.uptime;
+  })
+  .catch(err => console.error('Error:', err));
+}
+
+// Funciones WiFi
+function updateWiFi() {
+  if (wifiUpdateInProgress || updateInProgress) return;
+  
+  const ssid = document.getElementById('newSSID').value.trim();
+  const password = document.getElementById('newPassword').value.trim();
+  
+  if (!ssid) {
+    showWiFiMessage('Por favor ingresa un SSID válido', 'error');
+    return;
+  }
+  
+  if (!confirm('Conectar Gaia a la red "' + ssid + '"? El dispositivo se reiniciara para aplicar los cambios.')) {
+    return;
+  }
+  
+  wifiUpdateInProgress = true;
+  document.getElementById('wifiUpdateBtn').disabled = true;
+  document.getElementById('wifiUpdateIcon').innerHTML = '<span class="spinner"></span>Conectando...';
+  
+  showWiFiMessage('Conectando a la red WiFi...', 'warning');
+  
+  const data = {
+    ssid: ssid,
+    password: password
+  };
+  
+  fetch('/update-wifi', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(data)
+  })
+  .then(r => {
+    if (!r.ok) throw new Error(`Error ${r.status}: ${r.statusText}`);
+    return r.text();
+  })
+  .then(response => {
+    showWiFiMessage('Configuracion guardada. Gaia se conectara a "' + ssid + '" y se reiniciara...', 'success');
+    
+    setTimeout(() => {
+      showWiFiMessage('Esperando reconexion del dispositivo...', 'warning');
+      setTimeout(checkReconnection, 10000);
+    }, 3000);
+  })
+  .catch(err => {
+    showWiFiMessage('Error: ' + err.message, 'error');
+    wifiUpdateInProgress = false;
+    document.getElementById('wifiUpdateBtn').disabled = false;
+    document.getElementById('wifiUpdateIcon').textContent = 'Conectar a Nueva Red';
+  });
+}
+
+function showWiFiMessage(message, type) {
+  const messageEl = document.getElementById('wifiMessage');
+  const typeClasses = {
+    success: 'success-box',
+    warning: 'warning-box',
+    error: 'warning-box'
+  };
+  
+  messageEl.className = typeClasses[type] || 'warning-box';
+  messageEl.textContent = message;
+  messageEl.style.display = 'block';
+}
+
+// Funciones de estado y utilidades
 function setStatus(text, type = 'ok') {
-  const statusEl = document.getElementById('status');
+  const statusEl = document.getElementById('wifiStatus');
   const indicators = { ok: 'status-ok', warning: 'status-warning', error: 'status-error' };
   statusEl.innerHTML = `<span class="status-indicator ${indicators[type]}"></span>${text}`;
 }
@@ -375,12 +783,12 @@ function showWarning(show = true) {
   document.getElementById('warningBox').style.display = show ? 'block' : 'none';
 }
 
+// Funciones de actualización OTA (mantenidas intactas)
 function checkUpdate() {
-  if(updateInProgress) return;
+  if(updateInProgress || wifiUpdateInProgress) return;
   
   document.getElementById('checkBtn').disabled = true;
-  document.getElementById('checkIcon').innerHTML = '<span class="spinner"></span>';
-  setStatus('Verificando GitHub...', 'warning');
+  document.getElementById('checkIcon').innerHTML = '<span class="spinner"></span>Verificando...';
   
   fetch('/check-update')
   .then(r => {
@@ -388,36 +796,36 @@ function checkUpdate() {
     return r.json();
   })
   .then(data => {
+    document.getElementById('latestVersion').textContent = data.latest || 'Error al verificar';
+    
     if(data.updateAvailable){
-      setStatus(`Nueva version disponible: ${data.latest}`, 'warning');
       document.getElementById('updateBtn').disabled = false;
     } else {
-      setStatus(`Firmware actualizado (${data.current})`, 'ok');
+      // No hay actualización disponible
     }
   })
   .catch(err => {
-    setStatus('Error al verificar: ' + err.message, 'error');
+    document.getElementById('latestVersion').textContent = 'Error: ' + err.message;
     console.error('Error:', err);
   })
   .finally(() => {
     document.getElementById('checkBtn').disabled = false;
-    document.getElementById('checkIcon').textContent = '🔍';
+    document.getElementById('checkIcon').textContent = 'Buscar Actualizaciones';
   });
 }
 
 function doUpdate() {
-  if(updateInProgress) return;
+  if(updateInProgress || wifiUpdateInProgress) return;
   
-  if (!confirm('¿Seguro de que quieres actualizar el firmware? El proceso tarda varios minutos.')) {
+  if (!confirm('Seguro de que quieres actualizar el firmware? El proceso tarda varios minutos.')) {
     return;
   }
   
   updateInProgress = true;
   document.getElementById('updateBtn').disabled = true;
   document.getElementById('checkBtn').disabled = true;
-  document.getElementById('updateIcon').innerHTML = '<span class="spinner"></span>';
+  document.getElementById('updateIcon').innerHTML = '<span class="spinner"></span>Actualizando...';
   
-  setStatus('Iniciando actualización...', 'warning');
   showProgress(true);
   showWarning(true);
   setProgress(0, 'Conectando al servidor...');
@@ -437,24 +845,22 @@ function doUpdate() {
   })
   .then(response => {
     clearInterval(progressTimer);
-    setProgress(100, 'Actualización completada');
-    setStatus('Firmware actualizado. Reiniciando...', 'ok');
+    setProgress(100, 'Actualizacion completada');
     
     setTimeout(() => {
-      setStatus('Esperando reconexión...', 'warning');
       setProgress(0, 'Reconectando...');
       checkReconnection();
     }, 8000);
   })
   .catch(err => {
     clearInterval(progressTimer);
-    setStatus('Error: ' + err.message, 'error');
     showProgress(false);
     showWarning(false);
     updateInProgress = false;
     document.getElementById('updateBtn').disabled = false;
     document.getElementById('checkBtn').disabled = false;
-    document.getElementById('updateIcon').textContent = '⚡';
+    document.getElementById('updateIcon').textContent = 'Actualizar Firmware';
+    alert('Error: ' + err.message);
   });
 }
 
@@ -462,7 +868,6 @@ function checkReconnection() {
   fetch('/', { cache: 'no-cache' })
   .then(r => {
     if(r.ok) {
-      setStatus('Reconexión exitosa', 'ok');
       setProgress(100, 'Recargando interfaz...');
       setTimeout(() => window.location.reload(), 2000);
     }
@@ -472,11 +877,8 @@ function checkReconnection() {
   });
 }
 
-// Inicialización
-document.getElementById('deviceIP').textContent = window.location.hostname + ':' + window.location.port;
-setTimeout(() => {
-  if (!updateInProgress) checkUpdate();
-}, 2000);
+// Actualizar información del sistema cada 30 segundos
+setInterval(updateSystemInfo, 30000);
 </script>
 </body>
 </html>
@@ -484,15 +886,68 @@ setTimeout(() => {
   return html;
 }
 
-// ---------------- WebServer ----------------
+// ---------------- Configuración del servidor web ----------------
+
+/**
+ * Configura todos los endpoints del servidor web
+ */
 void setupServer() {
+  // Página principal
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "text/html", mainPageHTML());
   });
 
+  // Información del sistema
+  server.on("/system-info", HTTP_GET, [](AsyncWebServerRequest* request) {
+    String json = "{";
+    json += "\"freeHeap\":\"" + String(ESP.getFreeHeap() / 1024) + " KB\",";
+    json += "\"freeSketch\":\"" + String(ESP.getFreeSketchSpace() / 1024) + " KB\",";
+    json += "\"uptime\":\"" + String(millis() / 1000 / 60) + " minutos\"";
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  // Actualizar configuración WiFi
+  server.on("/update-wifi", HTTP_POST, [](AsyncWebServerRequest* request) {}, NULL,
+    [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (otaInProgress) {
+        request->send(503, "text/plain", "OTA en progreso");
+        return;
+      }
+      
+      String body = String((char*)data).substring(0, len);
+      JsonDocument doc;
+      deserializeJson(doc, body);
+      
+      String newSSID = doc["ssid"].as<String>();
+      String newPassword = doc["password"].as<String>();
+      
+      if (newSSID.length() > 0) {
+        Serial.println("[WiFi] Nueva configuración recibida: " + newSSID);
+        
+        // Guardar credenciales
+        saveWiFiCredentials(newSSID, newPassword);
+        
+        // Enviar respuesta antes del reinicio
+        request->send(200, "text/plain", "Configuración guardada, reiniciando...");
+        
+        // Reiniciar después de un delay
+        delay(2000);
+        ESP.restart();
+      } else {
+        request->send(400, "text/plain", "SSID inválido");
+      }
+    });
+
+  // Verificar actualizaciones (mantenido intacto)
   server.on("/check-update", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (otaInProgress) {
       request->send(503, "application/json", "{\"error\":\"OTA en progreso\"}");
+      return;
+    }
+    
+    if (isAPMode) {
+      request->send(503, "application/json", "{\"error\":\"Sin conexión a internet\"}");
       return;
     }
     
@@ -507,15 +962,21 @@ void setupServer() {
     request->send(200, "application/json", json);
   });
 
+  // Ejecutar actualización OTA (mantenido intacto)
   server.on("/do-update", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (otaInProgress) {
-      request->send(503, "text/plain", "Actualizacion ya en progreso");
+      request->send(503, "text/plain", "Actualización ya en progreso");
+      return;
+    }
+    
+    if (isAPMode) {
+      request->send(503, "text/plain", "Sin conexión a internet para actualizar");
       return;
     }
     
     if (latestBinUrl != "" && String(FIRMWARE_VERSION) != latestVersion) {
       // Enviar respuesta inmediatamente
-      request->send(200, "text/plain", "Actualizacion iniciada - no cierres esta pagina");
+      request->send(200, "text/plain", "Actualización iniciada - no cierres esta página");
       
       // Iniciar OTA en tarea separada después de enviar respuesta
       xTaskCreate([](void* parameter) {
@@ -525,59 +986,111 @@ void setupServer() {
       }, "OTA_Task", 16384, NULL, 1, NULL); // Stack más grande
       
     } else {
-      request->send(400, "text/plain", "No hay actualizacion disponible");
+      request->send(400, "text/plain", "No hay actualización disponible");
     }
   });
 
   server.begin();
-  Serial.println("Servidor web iniciado");
+  Serial.println("[Web] Servidor web iniciado");
 }
 
-// ---------------- Main ----------------
+// ---------------- Configuración principal ----------------
+
 void setup() {
   Serial.begin(115200);
   delay(2000);
   
-  Serial.println("\n" + String("==========================================="));
+  Serial.println("\n===========================================");
   Serial.println("Gaia v" + String(FIRMWARE_VERSION));
-  Serial.println("ESP32-S3 OTA - Chunk Method con Watchdog Optimizado");
+  Serial.println("ESP32-S3 Estación Meteorológica");
+  Serial.println("Sistema de configuración WiFi y OTA");
   Serial.println("===========================================");
   
-  Serial.printf("RAM libre: %d KB\n", ESP.getFreeHeap() / 1024);
-  Serial.printf("Flash libre: %d KB\n", ESP.getFreeSketchSpace() / 1024);
-  Serial.printf("Tamaño chunks: 64 bytes (ultra-pequeños)\n");
+  // Inicializar EEPROM
+  EEPROM.begin(EEPROM_SIZE);
   
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando WiFi");
+  // Información del sistema
+  Serial.printf("[Sys] RAM libre: %d KB\n", ESP.getFreeHeap() / 1024);
+  Serial.printf("[Sys] Flash libre: %d KB\n", ESP.getFreeSketchSpace() / 1024);
   
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
+  // Intentar cargar credenciales WiFi guardadas
+  bool hasCredentials = loadWiFiCredentials();
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" WiFi Conectado");
-    Serial.println("IP: " + WiFi.localIP().toString());
-    Serial.println("RSSI: " + String(WiFi.RSSI()) + " dBm");
+  if (hasCredentials) {
+    // Intentar conectarse a la red guardada
+    Serial.println("[Setup] Intentando conectar con credenciales guardadas...");
+    
+    if (connectToWiFi(currentSSID, currentPassword)) {
+      // Conexión exitosa
+      isAPMode = false;
+      Serial.println("[Setup] Conectado a WiFi guardado");
+    } else {
+      // Falló la conexión, activar modo AP
+      Serial.println("[Setup] Falló conexión WiFi, iniciando modo AP");
+      startAccessPoint();
+    }
   } else {
-    Serial.println(" Error de conexión");
-    return;
+    // No hay credenciales, iniciar en modo AP
+    Serial.println("[Setup] No hay credenciales WiFi, iniciando modo AP");
+    startAccessPoint();
   }
-
-  if (MDNS.begin(hostname)) {
-    Serial.println("mDNS: http://" + String(hostname) + ".local");
+  
+  // Configurar mDNS solo si no estamos en modo AP
+  if (!isAPMode) {
+    // Delay para asegurar que WiFi esté completamente inicializado
+    delay(1000);
+    if (MDNS.begin(hostname)) {
+      Serial.println("[mDNS] Servicio iniciado: http://" + String(hostname) + ".local");
+      MDNS.addService("http", "tcp", 80);
+    }
   }
-
+  
+  // Configurar servidor web
   setupServer();
   
   Serial.println("===========================================");
-  Serial.println("Sistema listo: http://" + WiFi.localIP().toString());
+  if (isAPMode) {
+    Serial.println("[Setup] Modo AP activo - http://" + WiFi.softAPIP().toString());
+    Serial.println("[Setup] También disponible en: http://" + String(hostname) + ".local");
+  } else {
+    Serial.println("[Setup] Conectado a WiFi: http://" + WiFi.localIP().toString());
+    Serial.println("[Setup] También disponible en: http://" + String(hostname) + ".local");
+  }
   Serial.println("===========================================");
 }
 
 void loop() {
-  delay(200);
+  // Verificar estado de la conexión WiFi si no estamos en modo AP
+  if (!isAPMode && WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Loop] Conexión WiFi perdida, reintentando...");
+    
+    // Intentar reconectar
+    if (!connectToWiFi(currentSSID, currentPassword)) {
+      Serial.println("[Loop] Reconexión fallida, cambiando a modo AP");
+      startAccessPoint();
+      
+      // Parar mDNS antes de cambiar a modo AP
+      MDNS.end();
+      
+      // Reiniciar servidor para el nuevo modo
+      server.end();
+      delay(1000);
+      setupServer();
+    } else {
+      // Reconexión exitosa, reiniciar mDNS si es necesario
+      isAPMode = false;
+      Serial.println("[Loop] Reconectado a WiFi, reiniciando mDNS...");
+      MDNS.end();
+      delay(500); // Mayor delay para asegurar limpieza
+      if (MDNS.begin(hostname)) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("_http", "_tcp", 80);
+        MDNS.addServiceTxt("http", "tcp", "board", "esp32s3");
+        MDNS.addServiceTxt("http", "tcp", "device", "gaia");
+        Serial.println("[Loop] mDNS reiniciado tras reconexión");
+      }
+    }
+  }
+  
+  delay(5000); // Verificar cada 5 segundos
 }
